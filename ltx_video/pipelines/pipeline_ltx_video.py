@@ -938,6 +938,7 @@ class LTXVideoPipeline(DiffusionPipeline):
             f"skip_initial_inference_steps ({skip_initial_inference_steps}) is used for image-to-image/video-to-video - "
             "media_item or latents should be provided."
         )
+        num_inference_steps = 8
 
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,

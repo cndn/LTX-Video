@@ -9,6 +9,34 @@ import yaml
 import imageio
 import json
 import numpy as np
+
+
+def to_hwc3_uint8(x):
+    """Ensure (H,W,3) uint8 with sane range."""
+    x = np.asarray(x)
+    if x.ndim == 2:  # (H,W) -> (H,W,3)
+        x = np.stack([x, x, x], axis=-1)
+    elif x.ndim == 3 and x.shape[2] == 1:
+        x = np.concatenate([x, x, x], axis=2)
+    elif x.ndim == 3 and x.shape[2] > 3:
+        x = x[:, :, :3]
+
+    x = np.nan_to_num(x, nan=0.0, posinf=255.0, neginf=0.0)
+
+    if np.issubdtype(x.dtype, np.floating):
+        mn, mx = float(x.min()), float(x.max())
+        if mn >= -1.1 and mx <= 1.1 and mn < 0:   # [-1,1]
+            x = (x + 1.0) * 0.5
+            x = np.clip(x, 0, 1) * 255.0
+        elif mn >= 0.0 and mx <= 1.0:             # [0,1]
+            x = np.clip(x, 0, 1) * 255.0
+        else:
+            x = np.clip(x, 0, 255.0)
+        x = x.astype(np.uint8, copy=False)
+    elif x.dtype != np.uint8:
+        x = np.clip(x, 0, 255).astype(np.uint8, copy=False)
+
+    return np.ascontiguousarray(x)
 import torch
 from safetensors import safe_open
 from PIL import Image
@@ -597,14 +625,13 @@ def infer(config: InferenceConfig):
     if pad_right == 0:
         pad_right = images.shape[4]
     images = images[:, :, : config.num_frames, pad_top:pad_bottom, pad_left:pad_right]
-
     for i in range(images.shape[0]):
-        # Gathering from B, C, F, H, W to C, F, H, W and then permuting to F, H, W, C
+        # Convert from B, C, F, H, W to F, H, W, C
         video_np = images[i].permute(1, 2, 3, 0).cpu().float().numpy()
-        # Unnormalizing images to [0, 255] range
-        video_np = (video_np * 255).astype(np.uint8)
         fps = config.frame_rate
+        
         height, width = video_np.shape[1:3]
+        
         # In case a single image is generated
         if video_np.shape[0] == 1:
             output_filename = get_unique_filename(
@@ -615,7 +642,8 @@ def infer(config: InferenceConfig):
                 resolution=(height, width, config.num_frames),
                 dir=output_dir,
             )
-            imageio.imwrite(output_filename, video_np[0])
+            frame_uint8 = to_hwc3_uint8(video_np[0])
+            imageio.imwrite(output_filename, frame_uint8)
         else:
             output_filename = get_unique_filename(
                 f"video_output_{i}",
@@ -626,10 +654,21 @@ def infer(config: InferenceConfig):
                 dir=output_dir,
             )
 
-            # Write video
-            with imageio.get_writer(output_filename, fps=fps) as video:
+            # Write video using robust method from debug_shape.py
+            writer = imageio.get_writer(
+                output_filename,
+                fps=fps,
+                codec="libx264",
+                format="FFMPEG",
+                ffmpeg_params=[
+                    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                    "-pix_fmt", "yuv420p",
+                ],
+            )
+            
+            with writer:
                 for frame in video_np:
-                    video.append_data(frame)
+                    writer.append_data(to_hwc3_uint8(frame))
 
         logger.warning(f"Output saved to {output_filename}")
 
