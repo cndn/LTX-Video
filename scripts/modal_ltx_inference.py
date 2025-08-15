@@ -7,8 +7,22 @@ from typing import Optional
 import modal
 app = modal.App("example-ltx")
 MINUTES = 60  # seconds
+# image = (
+#     modal.Image.debian_slim(python_version="3.12")
+#     .pip_install(
+#         "accelerate==1.6.0",
+#         "diffusers==0.33.1",
+#         "hf_transfer==0.1.9",
+#         "imageio==2.37.0",
+#         "imageio-ffmpeg==0.5.1",
+#         "sentencepiece==0.2.0",
+#         "torch==2.7.0",
+#         "transformers==4.51.3",
+#     )
+#     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+# )
 image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.from_registry("nvcr.io/nvidia/pytorch:25.02-py3")
     .pip_install(
         "accelerate==1.6.0",
         "diffusers==0.33.1",
@@ -16,8 +30,9 @@ image = (
         "imageio==2.37.0",
         "imageio-ffmpeg==0.5.1",
         "sentencepiece==0.2.0",
-        "torch==2.7.0",
         "transformers==4.51.3",
+        ""
+        # torch comes preinstalled inside this base image
     )
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
 )
@@ -28,17 +43,6 @@ MODEL_VOLUME_NAME = "ltx-model"
 model = modal.Volume.from_name(MODEL_VOLUME_NAME, create_if_missing=True)
 MODEL_PATH = Path("/models")
 image = image.env({"HF_HOME": str(MODEL_PATH)})
-
-DEFAULT_PROMPT = (
-    "The camera pans over a snow-covered mountain range,"
-    " revealing a vast expanse of snow-capped peaks and valleys."
-    " The mountains are covered in a thick layer of snow,"
-    " with some areas appearing almost white while others have a slightly darker, almost grayish hue."
-    " The peaks are jagged and irregular, with some rising sharply into the sky"
-    " while others are more rounded."
-    " The valleys are deep and narrow, with steep slopes that are also covered in snow."
-    " The trees in the foreground are mostly bare, with only a few leaves remaining on their branches."
-)
 
 
 def slugify(prompt):
@@ -52,9 +56,10 @@ def slugify(prompt):
 @app.cls(
     image=image,  # use our container Image
     volumes={OUTPUTS_PATH: outputs, MODEL_PATH: model},  # attach our Volumes
-    gpu="H100",  # use a big, fast GPU
+    gpu="B200",  # use a big, fast GPU
     timeout=10 * MINUTES,  # run inference for up to 10 minutes
     scaledown_window=15 * MINUTES,  # stay idle for 15 minutes before scaling down
+    min_containers=1,
 )
 class LTX:
     @modal.enter()
@@ -73,7 +78,7 @@ class LTX:
         prompt,
         negative_prompt="",
         num_inference_steps=8,
-        num_frames=120,
+        num_frames=48,
         width=832,
         height=480,
     ):
@@ -94,4 +99,11 @@ class LTX:
         outputs.commit()
         return mp4_name
 
-
+sb_app = modal.App.lookup("sb_app", create_if_missing=True)
+sb = modal.Sandbox.create(
+    image=image,
+    volumes={OUTPUTS_PATH: outputs, MODEL_PATH: model},
+    workdir="/repo",
+    app=sb_app,
+)
+process = sb.exec("modal", "run scripts/modal_ltx_inference.py --prompt 'astronauts walks on the moon and some random person appears'", timeout=300)

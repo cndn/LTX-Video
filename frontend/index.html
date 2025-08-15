@@ -1,0 +1,89 @@
+<script>
+  const VIDEO = document.getElementById("video");
+  const STATUS = document.getElementById("status");
+  const BTN = document.getElementById("start");
+  const HEALTH_BTN = document.getElementById("health");
+  const PROMPT = document.getElementById("prompt");
+
+  // Your actual Modal URL
+  const MODAL_BASE = "https://zjudn2013--ltxv-webrtc-fixed-webrtc-app.modal.run";
+
+  function updateStatus(message, type = 'info') {
+    STATUS.textContent = message;
+    STATUS.className = type;
+    console.log(`[${type}] ${message}`);
+  }
+
+  HEALTH_BTN.onclick = async () => {
+    try {
+      const resp = await fetch(`${MODAL_BASE}/health`);
+      const data = await resp.json();
+      updateStatus(`Health: ${data.status}, Pipeline: ${data.pipeline}`, 'success');
+    } catch (e) {
+      updateStatus(`Health check failed: ${e.message}`, 'error');
+    }
+  };
+
+  BTN.onclick = async () => {
+    BTN.disabled = true;
+    updateStatus("Starting WebRTC connection...");
+
+    try {
+      const pc = new RTCPeerConnection({
+        iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }],
+      });
+
+      pc.ontrack = (e) => {
+        updateStatus("Video stream received!", 'success');
+        VIDEO.srcObject = e.streams[0];
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        updateStatus(`ICE Connection: ${pc.iceConnectionState}`);
+        if (pc.iceConnectionState === 'connected') {
+          updateStatus("WebRTC connected! Generating video...", 'success');
+        } else if (pc.iceConnectionState === 'failed') {
+          updateStatus("Connection failed. Please try again.", 'error');
+          BTN.disabled = false;
+        }
+      };
+
+      // Create data channel
+      pc.createDataChannel("ctrl");
+
+      // Create offer
+      const offer = await pc.createOffer({ offerToReceiveVideo: true });
+      await pc.setLocalDescription(offer);
+
+      updateStatus("Sending offer to Modal...");
+
+      // Send offer to Modal - MAKE SURE THIS USES MODAL_BASE
+      const resp = await fetch(`${MODAL_BASE}/offer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sdp: offer.sdp,
+          type: offer.type,
+          prompt: PROMPT.value,
+          num_frames: 48,
+          height: 384,
+          width: 672,
+          fps: 12,
+        }),
+      });
+
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+      }
+
+      const ans = await resp.json();
+      await pc.setRemoteDescription(ans);
+      
+      updateStatus("WebRTC established. Waiting for video...", 'success');
+
+    } catch (error) {
+      updateStatus(`Error: ${error.message}`, 'error');
+      BTN.disabled = false;
+    }
+  };
+</script>
