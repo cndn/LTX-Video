@@ -10,8 +10,25 @@
 #     "prompt": "cat sleeping"
 #   }' | jq .
 import modal
+from pathlib import Path
+import string
+import time
 
 app = modal.App("ltxv-webrtc-fixed")
+
+VOLUME_NAME = "ltxv-outputs"
+outputs = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
+OUTPUTS_PATH = Path("/outputs")
+MODEL_VOLUME_NAME = "ltx-model"
+model = modal.Volume.from_name(MODEL_VOLUME_NAME, create_if_missing=True)
+MODEL_PATH = Path("/models")
+def slugify(prompt):
+    for char in string.punctuation:
+        prompt = prompt.replace(char, "")
+    prompt = prompt.replace(" ", "_")
+    prompt = prompt[:230]  # some OSes limit filenames to <256 chars
+    mp4_name = str(int(time.time())) + "_" + prompt + ".mp4"
+    return mp4_name
 
 # Fixed image with proper dependencies
 image = (
@@ -46,7 +63,7 @@ image = (
         "imageio[ffmpeg]",
         "hf_transfer==0.1.9",
     )
-    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "HF_HOME": str(MODEL_PATH)})
 )
 
 @app.function(
@@ -56,6 +73,7 @@ image = (
     keep_warm=1,
     allow_concurrent_inputs=10,
     timeout=60 * 30,
+    volumes={str(OUTPUTS_PATH): outputs, str(MODEL_PATH): model}, 
 )
 @modal.asgi_app()
 def webrtc_app():
@@ -139,7 +157,7 @@ def webrtc_app():
         """WebRTC video track with proper cleanup."""
         kind = "video"
 
-        def __init__(self, prompt: str, num_frames: int = 48, height: int = 384, width: int = 672, fps: int = 12):
+        def __init__(self, prompt: str, num_frames: int = 48, height: int = 480, width: int = 854, fps: int = 12):
             super().__init__()
             self.prompt = prompt
             self.num_frames = min(num_frames, 48)
@@ -177,7 +195,7 @@ def webrtc_app():
                 logger.info(f"Starting video generation for: {self.prompt}")
                 
                 # First, generate some immediate test frames
-                # await self._generate_ltx_frames()
+                # await self._generate_test_frames()
                 
                 # if self._shutdown:
                 #     return
@@ -247,6 +265,10 @@ def webrtc_app():
             
             frames = result.frames[0] if hasattr(result, 'frames') else result.images
             logger.info(f"Generated {len(frames)} LTX frames")
+            from diffusers.utils import export_to_video
+            mp4_name = slugify(self.prompt)
+            export_to_video(frames, Path(OUTPUTS_PATH) / mp4_name)
+            outputs.commit()
             
             for frame in frames:
                 if self._shutdown:
@@ -371,30 +393,27 @@ def webrtc_app():
         width: int = Body(672, embed=True),
         fps: int = Body(12, embed=True),
     ):
-        """WebRTC offer with manual direction fixing."""
+        """WebRTC offer with proper aiortc configuration."""
         pc = None
         track = None
         
         try:
             logger.info(f"Received offer for prompt: {prompt}")
             
-            # Create peer connection
-            pc = RTCPeerConnection()
+            # FIXED: aiortc expects RTCConfiguration object, not dict
+            from aiortc import RTCConfiguration, RTCIceServer
             
-            # Set remote description FIRST to see what the browser wants
-            logger.info("Setting remote description first...")
-            offer_obj = RTCSessionDescription(sdp=sdp, type=type)
-            await pc.setRemoteDescription(offer_obj)
-            logger.info("Remote description set")
+            config = RTCConfiguration(
+                iceServers=[
+                    RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
+                    RTCIceServer(urls=["stun:stun1.l.google.com:19302"]),
+                    RTCIceServer(urls=["stun:stun2.l.google.com:19302"]),
+                ]
+            )
+            pc = RTCPeerConnection(configuration=config)
+            logger.info("RTCPeerConnection created with ICE servers")
             
-            # Check what transceivers the browser created
-            transceivers = pc.getTransceivers()
-            logger.info(f"Browser created {len(transceivers)} transceivers")
-            
-            for i, t in enumerate(transceivers):
-                logger.info(f"Transceiver {i}: kind={t.kind}, direction={t.direction}, mid={t.mid}")
-            
-            # Create our video track
+            # Create video track
             track = LTXVideoTrack(
                 prompt=prompt, 
                 num_frames=min(num_frames, 48),
@@ -403,88 +422,62 @@ def webrtc_app():
                 fps=fps
             )
             
-            # Find or create video transceiver
-            video_transceiver = None
-            for t in transceivers:
-                if t.kind == "video":
-                    video_transceiver = t
-                    break
-                    
-            if video_transceiver:
-                logger.info(f"Found existing video transceiver: direction={video_transceiver.direction}")
-                
-                # Replace the track in the existing transceiver
-                await video_transceiver.sender.replaceTrack(track)
-                logger.info("Replaced track in existing transceiver")
-                
-                # CRITICAL FIX: Manually set compatible directions
-                # Force the direction to be compatible
-                if hasattr(video_transceiver, '_direction'):
-                    original_direction = video_transceiver._direction
-                    logger.info(f"Original direction: {original_direction}")
-                    
-                    # Set to sendonly since we're only sending video
-                    video_transceiver._direction = "sendonly"
-                    logger.info("Forced direction to sendonly")
-                    
-                # Also fix the _offerDirection if it exists
-                if hasattr(video_transceiver, '_offerDirection'):
-                    logger.info(f"Original offer direction: {video_transceiver._offerDirection}")
-                    video_transceiver._offerDirection = "recvonly"  # Browser wants to receive
-                    logger.info("Set offer direction to recvonly")
-                    
-            else:
-                logger.info("No video transceiver found, adding our own")
-                # Add our own transceiver if none exists
-                video_transceiver = pc.addTransceiver(track, direction="sendonly")
-                logger.info("Added sendonly transceiver")
+            # Add transceiver
+            transceiver = pc.addTransceiver(track, direction="sendonly")
+            logger.info(f"Added sendonly transceiver: {transceiver}")
+            
+            # Set remote description
+            logger.info("Setting remote description...")
+            offer_obj = RTCSessionDescription(sdp=sdp, type=type)
+            await pc.setRemoteDescription(offer_obj)
+            logger.info("Remote description set successfully")
             
             # Create answer
             logger.info("Creating answer...")
             answer = await pc.createAnswer()
             logger.info(f"Answer created: {len(answer.sdp)} chars")
             
-            # MONKEY PATCH FIX: Temporarily patch the problematic function
+            # Enhanced monkey patch for direction issues
             import aiortc.rtcpeerconnection as rtc_module
-            
             original_and_direction = rtc_module.and_direction
             
             def safe_and_direction(a, b):
-                """Safe version that handles None values."""
-                logger.info(f"and_direction called with: a={a}, b={b}")
-                
+                logger.info(f"and_direction: a={a}, b={b}")
                 if a is None or b is None:
-                    logger.warning(f"None direction detected: a={a}, b={b}, returning sendonly")
+                    logger.warning(f"None direction, defaulting to sendonly")
                     return "sendonly"
-                    
                 try:
-                    return original_and_direction(a, b)
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"Direction error: {e}, returning sendonly")
+                    result = original_and_direction(a, b)
+                    logger.info(f"and_direction result: {result}")
+                    return result
+                except Exception as e:
+                    logger.warning(f"Direction error: {e}, defaulting to sendonly")
                     return "sendonly"
             
-            # Apply the patch
             rtc_module.and_direction = safe_and_direction
             
             try:
-                logger.info("Setting local description with patched function...")
                 await pc.setLocalDescription(answer)
                 logger.info("Local description set successfully")
             finally:
-                # Restore original function
                 rtc_module.and_direction = original_and_direction
             
-            # Setup monitoring
+            # Enhanced monitoring
             @pc.on("connectionstatechange")
-            async def on_state_change():
-                logger.info(f"PC connection state: {pc.connectionState}")
-                if pc.connectionState in ("failed", "closed", "disconnected"):
+            async def on_connection_state():
+                logger.info(f"Connection state changed: {pc.connectionState}")
+                
+            @pc.on("iceconnectionstatechange")
+            async def on_ice_state():
+                logger.info(f"ICE connection state changed: {pc.iceConnectionState}")
+                if pc.iceConnectionState == "failed":
+                    logger.error("ICE connection failed")
                     if track:
                         track.stop()
-
-            @pc.on("iceconnectionstatechange")
-            async def on_ice_state_change():
-                logger.info(f"ICE connection state: {pc.iceConnectionState}")
+            
+            @pc.on("icegatheringstatechange")
+            async def on_ice_gathering():
+                logger.info(f"ICE gathering state: {pc.iceGatheringState}")
 
             logger.info("WebRTC offer processed successfully")
             return JSONResponse({
@@ -496,9 +489,8 @@ def webrtc_app():
         except Exception as e:
             import traceback
             logger.error(f"Error in offer endpoint: {e}")
-            logger.error(f"Full traceback: {traceback.format_exc()}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
             
-            # Cleanup
             if track:
                 track.stop()
             if pc:
@@ -508,7 +500,6 @@ def webrtc_app():
                     pass
                     
             raise HTTPException(status_code=500, detail=f"Failed to process offer: {str(e)}")
-    
     # Cleanup function for graceful shutdown
     @app.on_event("shutdown")
     async def cleanup_on_shutdown():
