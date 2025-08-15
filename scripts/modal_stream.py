@@ -1,12 +1,14 @@
-
-import string
-import time
-import asyncio
-import numpy as np
-from pathlib import Path
-from typing import Optional
-import weakref
-
+# Usage: 
+# modal deploy scripts/modal_stream.py
+# local test: 
+# echo -e "\n=== Testing Simple Offer ==="
+# curl -s -X POST https://YOUR_MODAL_URL/offer \
+#   -H "Content-Type: application/json" \
+#   -d '{
+#     "sdp": "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n",
+#     "type": "offer",
+#     "prompt": "cat sleeping"
+#   }' | jq .
 import modal
 
 app = modal.App("ltxv-webrtc-fixed")
@@ -175,10 +177,10 @@ def webrtc_app():
                 logger.info(f"Starting video generation for: {self.prompt}")
                 
                 # First, generate some immediate test frames
-                await self._generate_test_frames()
+                # await self._generate_ltx_frames()
                 
-                if self._shutdown:
-                    return
+                # if self._shutdown:
+                #     return
                 
                 # Then try LTX generation
                 try:
